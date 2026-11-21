@@ -1,0 +1,131 @@
+name: Sign APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job ID
+        required: true
+        type: string
+      token:
+        description: Job token
+        required: true
+        type: string
+      worker_url:
+        description: Worker URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      TOKEN: ${{ inputs.token }}
+      WORKER_URL: ${{ inputs.worker_url }}
+    steps:
+      - name: Mask token
+        run: echo "::add-mask::$TOKEN"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android build-tools 34.0.0
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -x "$SDK/build-tools/34.0.0/apksigner" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SM" --licenses > /dev/null || true
+            "$SM" "build-tools;34.0.0"
+          fi
+          echo "BT=$SDK/build-tools/34.0.0" >> "$GITHUB_ENV"
+
+      - name: Strip, zipalign, sign, verify, deliver
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/work"
+          mkdir -p "$W"
+          cd "$W"
+          trap 'rm -rf "$W"' EXIT
+
+          fail() {
+            echo "ERROR: $1"
+            curl -sS --max-time 60 -X POST -H "Authorization: Bearer $TOKEN" \
+              --data "$1" "$WORKER_URL/callback/$JOB_ID?status=error" > /dev/null || true
+            exit 1
+          }
+
+          curl -fsSL --retry 3 --max-time 180 -H "Authorization: Bearer $TOKEN" \
+            "$WORKER_URL/input/$JOB_ID" -o in.apk || fail "Could not download the APK."
+          [ "$(stat -c%s in.apk)" -le 20971520 ] || fail "File is too large (max 20 MB)."
+
+          curl -fsSL --retry 3 --max-time 60 -H "Authorization: Bearer $TOKEN" \
+            "$WORKER_URL/config/$JOB_ID" -o cfg.json || fail "Could not load signing config."
+          KS_PASS="$(jq -r .ks_pass cfg.json)"
+          KEY_PASS="$(jq -r .key_pass cfg.json)"
+          ALIAS="$(jq -r .alias cfg.json)"
+          echo "::add-mask::$KS_PASS"
+          echo "::add-mask::$KEY_PASS"
+          echo "::add-mask::$ALIAS"
+          jq -r .keystore cfg.json | base64 -d > ks.jks || fail "Invalid keystore."
+          rm -f cfg.json
+          export KS_PASS KEY_PASS
+
+          python3 - <<'PY' || fail "The file is not a valid APK."
+          import re, shutil, sys, zipfile
+          sig = re.compile(r'^META-INF/([^/]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$', re.I)
+          with zipfile.ZipFile('in.apk') as zin:
+              if 'AndroidManifest.xml' not in zin.namelist():
+                  sys.exit(1)
+              with zipfile.ZipFile('stripped.apk', 'w') as zout:
+                  for info in zin.infolist():
+                      if sig.match(info.filename):
+                          continue
+                      new = zipfile.ZipInfo(info.filename, info.date_time)
+                      new.compress_type = info.compress_type
+                      new.external_attr = info.external_attr
+                      new.create_system = info.create_system
+                      if info.is_dir():
+                          zout.writestr(new, b'')
+                          continue
+                      with zin.open(info) as src, zout.open(new, 'w') as dst:
+                          shutil.copyfileobj(src, dst, 262144)
+          PY
+
+          "$BT/zipalign" -f -p 4 stripped.apk aligned.apk || fail "Zipalign failed."
+          "$BT/zipalign" -c -p 4 aligned.apk || fail "Zipalign check failed."
+
+          "$BT/apksigner" sign \
+            --ks ks.jks --ks-key-alias "$ALIAS" \
+            --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out signed.apk aligned.apk || fail "Signing failed. Check keystore settings."
+
+          OUT="$("$BT/apksigner" verify --verbose --min-sdk-version 21 signed.apk 2>&1)" \
+            || fail "Signature verification failed."
+          for v in v1 v2 v3; do
+            echo "$OUT" | grep -q "Verified using $v scheme.*: true" \
+              || fail "Signature scheme $v verification failed."
+          done
+
+         
+          CODE="$(curl -sS --retry 2 --max-time 300 -o resp.txt -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/octet-stream' \
+            --data-binary @signed.apk "$WORKER_URL/callback/$JOB_ID?status=ok")" \
+            || fail "Could not deliver the signed APK."
+          [ "$CODE" = "200" ] || fail "Delivery rejected by server ($CODE)."
+
+      - name: Notify on failure
+        if: failure() || cancelled()
+        run: |
+          curl -sS --max-time 60 -X POST -H "Authorization: Bearer $TOKEN" \
+            --data "Processing failed or timed out." \
+            "$WORKER_URL/callback/$JOB_ID?status=error" > /dev/null || true
